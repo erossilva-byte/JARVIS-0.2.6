@@ -1,0 +1,104 @@
+name: Build e testes do J.A.R.V.I.S. Nova
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jarvis-nova-bootstrap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Reconstruir fonte, testar e compilar APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Reconstruir e validar pacote-fonte
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .jarvis-payload/part-*.b64 > /tmp/jarvis-nova.tar.xz.b64
+          echo "285a1beeac891ebafe92e51417498e39533ef1b4b596d4d4b58d821a544766d7  /tmp/jarvis-nova.tar.xz" > /tmp/jarvis-nova.sha256
+          base64 --decode /tmp/jarvis-nova.tar.xz.b64 > /tmp/jarvis-nova.tar.xz
+          sha256sum --check /tmp/jarvis-nova.sha256
+          mkdir -p source
+          tar -xJf /tmp/jarvis-nova.tar.xz --strip-components=1 -C source
+          test -s source/package.json
+          test -s source/app.js
+          test -s source/.github/workflows/build-apk.yml
+          grep -q '"version": "0.9.1"' source/package.json
+          grep -q 'com.jarvis.nova' source/capacitor.config.json
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configurar Java para Android
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar dependências Node
+        working-directory: source
+        run: npm install --ignore-scripts --legacy-peer-deps
+
+      - name: Testes estáticos e regressão
+        working-directory: source
+        run: npm run test:all
+
+      - name: Preparar recursos web
+        working-directory: source
+        run: |
+          mkdir -p www
+          cp index.html style.css app.js apps.js www/
+
+      - name: Gerar estrutura Android
+        working-directory: source
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Aplicar identidade e permissões nativas
+        working-directory: source
+        run: |
+          set -euo pipefail
+          D=android/app/src/main/java/com/jarvis/nova
+          mkdir -p "$D"
+          cp MainActivity.java JarvisBackgroundPlugin.java JarvisService.java JarvisUtilPlugin.java JarvisAlarmReceiver.java "$D/"
+          python3 patch_manifest.py android/app/src/main/AndroidManifest.xml
+          python3 patch_android_version.py android/app/build.gradle VERSAO.json
+          python3 patch_visual.py android
+
+      - name: Compilar APK debug
+        working-directory: source/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          if ! ./gradlew assembleDebug --no-daemon; then
+            echo "Primeira compilação falhou; tentando sem as personalizações de splash/ícone."
+            python3 ../patch_visual.py . desfazer
+            ./gradlew assembleDebug --no-daemon
+          fi
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          sha256sum app/build/outputs/apk/debug/app-debug.apk | tee apk-sha256.txt
+
+      - name: Publicar APK e checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: JARVIS-Nova-0.9.1-APK
+          if-no-files-found: error
+          path: |
+            source/android/app/build/outputs/apk/debug/app-debug.apk
+            source/android/apk-sha256.txt
+          retention-days: 14
